@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# MetaDIG – SecurityTrails subdomains → dig CNAME/A → optional ASN enrichment
+# Includes: aligned output, colored keywords, keyword frequency summary,
+# Python 3.8+ compatibility, SecurityTrails retries + configurable timeout.
+
+from __future__ import annotations
+
 import os
 import sys
 import json
@@ -6,8 +12,11 @@ import argparse
 import subprocess
 import urllib.parse
 import urllib.request
+import urllib.error
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Tuple, Optional
 
 ST_BASE = "https://api.securitytrails.com/v1"
 
@@ -15,7 +24,6 @@ ANSI_RESET = "\033[0m"
 ANSI_RED = "\033[31m"
 ANSI_BLUE = "\033[34m"
 ANSI_YELLOW = "\033[33m"
-
 
 RED_KEYWORDS = [
     "cloudfront",
@@ -39,21 +47,64 @@ YELLOW_KEYWORDS = [
 ]
 
 
-def run_cmd(cmd: list[str], timeout: int = 12) -> str:
+def run_cmd(cmd: List[str], timeout: int = 12) -> str:
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if p.returncode != 0:
         return ""
     return p.stdout.strip()
 
 
-def http_get_json(url: str, headers: dict[str, str], timeout: int = 20) -> dict:
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = resp.read().decode("utf-8", errors="replace")
-        return json.loads(data)
+def http_get_json(
+    url: str,
+    headers: Dict[str, str],
+    timeout: int = 45,
+    retries: int = 4,
+    backoff_base: float = 1.5,
+) -> Dict:
+    """
+    Robust GET JSON with retries and better error reporting.
+    Retries on TimeoutError / URLError (network, DNS, TLS, timeouts).
+    Raises RuntimeError on HTTP error codes with response snippet.
+    """
+    last_err: Optional[BaseException] = None
+
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read().decode("utf-8", errors="replace")
+                return json.loads(data)
+
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            snippet = body[:800].replace("\n", " ")
+            raise RuntimeError(f"SecurityTrails HTTP {e.code} – {snippet}") from e
+
+        except (TimeoutError, urllib.error.URLError) as e:
+            last_err = e
+            if attempt >= retries:
+                break
+            sleep_s = (backoff_base ** attempt)
+            time.sleep(sleep_s)
+
+        except json.JSONDecodeError as e:
+            raise RuntimeError("SecurityTrails returned non JSON response") from e
+
+    raise RuntimeError(f"SecurityTrails request failed after retries: {url}") from last_err
 
 
-def st_list_subdomains(apex: str, api_key: str, children_only: bool, include_inactive: bool) -> list[str]:
+def st_list_subdomains(
+    apex: str,
+    api_key: str,
+    children_only: bool,
+    include_inactive: bool,
+    timeout: int,
+    retries: int,
+) -> List[str]:
     apex = apex.strip().lower().strip(".")
     params = {
         "children_only": "true" if children_only else "false",
@@ -67,17 +118,18 @@ def st_list_subdomains(apex: str, api_key: str, children_only: bool, include_ina
         "User-Agent": "MetaDIG/1.0",
     }
 
-    data = http_get_json(url, headers=headers)
+    data = http_get_json(url, headers=headers, timeout=timeout, retries=retries)
     subs = data.get("subdomains", []) or []
 
-    fqdn_list: list[str] = []
+    fqdn_list: List[str] = []
     for s in subs:
         s = (s or "").strip().strip(".")
         if s:
             fqdn_list.append(f"{s}.{apex}".lower())
 
+    # De dup, stable order
     seen = set()
-    out: list[str] = []
+    out: List[str] = []
     for f in fqdn_list:
         if f not in seen:
             seen.add(f)
@@ -85,12 +137,15 @@ def st_list_subdomains(apex: str, api_key: str, children_only: bool, include_ina
     return out
 
 
-def dig_answers(name: str) -> list[dict]:
+def dig_answers(name: str) -> List[Dict]:
+    """
+    dig +noall +answer output: <name> <ttl> <class> <type> <rdata...>
+    """
     out = run_cmd(["dig", "+noall", "+answer", name], timeout=12)
     if not out:
         return []
 
-    answers: list[dict] = []
+    answers: List[Dict] = []
     for line in out.splitlines():
         parts = line.split()
         if len(parts) < 5:
@@ -105,7 +160,10 @@ def dig_answers(name: str) -> list[dict]:
     return answers
 
 
-def cymru_asn(ip: str) -> dict:
+def cymru_asn(ip: str) -> Dict:
+    """
+    Team Cymru: whois -h whois.cymru.com -v <ip>
+    """
     out = run_cmd(["whois", "-h", "whois.cymru.com", "-v", ip], timeout=12)
     if not out:
         return {}
@@ -129,7 +187,7 @@ def summarize_fqdn(fqdn: str, do_asn: bool) -> str:
 
     cname_part = f"CNAME {cnames[0]['value']}" if cnames else ""
 
-    a_parts: list[str] = []
+    a_parts: List[str] = []
     for a in arecs:
         ip = a["value"]
         ttl = a["ttl"]
@@ -152,16 +210,14 @@ def summarize_fqdn(fqdn: str, do_asn: bool) -> str:
     return " ".join(bits).strip()
 
 
-def _build_color_patterns() -> list[tuple[re.Pattern, str]]:
-    patterns: list[tuple[re.Pattern, str]] = []
+def _build_color_patterns() -> List[Tuple[re.Pattern, str]]:
+    patterns: List[Tuple[re.Pattern, str]] = []
 
+    # Longer matches first to reduce annoying overlaps
     for kw in sorted(RED_KEYWORDS, key=len, reverse=True):
         patterns.append((re.compile(re.escape(kw), re.IGNORECASE), ANSI_RED))
-
     for kw in sorted(BLUE_KEYWORDS, key=len, reverse=True):
         patterns.append((re.compile(re.escape(kw), re.IGNORECASE), ANSI_BLUE))
-
-    # Put api last so it does not interfere with longer matches
     for kw in sorted(YELLOW_KEYWORDS, key=len, reverse=True):
         patterns.append((re.compile(re.escape(kw), re.IGNORECASE), ANSI_YELLOW))
 
@@ -173,37 +229,59 @@ ALL_KEYWORDS_ORDERED = RED_KEYWORDS + BLUE_KEYWORDS + YELLOW_KEYWORDS
 
 
 def colorize(text: str) -> str:
-    # Apply patterns in order. This can recolor already colored text if keywords overlap.
-    # Ordering reduces annoying cases, but does not eliminate all overlaps.
     out = text
     for pattern, color in COLOR_PATTERNS:
         out = pattern.sub(lambda m: f"{color}{m.group(0)}{ANSI_RESET}", out)
     return out
 
 
-def update_freq(freq: dict[str, int], text: str) -> None:
+def update_freq(freq: Dict[str, int], text: str) -> None:
     lowered = text.lower()
     for kw in ALL_KEYWORDS_ORDERED:
         if kw.lower() in lowered:
             freq[kw] = freq.get(kw, 0) + 1
 
 
-def main():
-    ap = argparse.ArgumentParser(description="SecurityTrails subdomains → dig CNAME/A → optional ASN enrichment, colored output, keyword stats")
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="SecurityTrails subdomains → dig CNAME/A → ASN enrich (optional) + colors + stats"
+    )
     ap.add_argument("apex", help="Apex domain, e.g. accor.com")
-    ap.add_argument("--api-key", default=os.getenv("SECURITYTRAILS_APIKEY", ""), help="SecurityTrails API key or env SECURITYTRAILS_APIKEY")
+    ap.add_argument(
+        "--api-key",
+        default=os.getenv("SECURITYTRAILS_APIKEY", ""),
+        help="SecurityTrails API key or env SECURITYTRAILS_APIKEY",
+    )
     ap.add_argument("--children-only", action="store_true")
     ap.add_argument("--include-inactive", action="store_true")
     ap.add_argument("--no-asn", action="store_true")
     ap.add_argument("--workers", type=int, default=20)
     ap.add_argument("--limit", type=int, default=0)
+
+    # Robustness knobs
+    ap.add_argument("--timeout", type=int, default=45, help="SecurityTrails API timeout (seconds)")
+    ap.add_argument("--retries", type=int, default=4, help="SecurityTrails API retries on timeout/network errors")
+
     args = ap.parse_args()
 
     if not args.api_key:
         print("Missing API key. Use --api-key or set SECURITYTRAILS_APIKEY.", file=sys.stderr)
         sys.exit(2)
 
-    subs = st_list_subdomains(args.apex, args.api_key, args.children_only, args.include_inactive)
+    try:
+        subs = st_list_subdomains(
+            args.apex,
+            args.api_key,
+            args.children_only,
+            args.include_inactive,
+            timeout=args.timeout,
+            retries=args.retries,
+        )
+    except Exception as e:
+        print(f"Error fetching subdomains from SecurityTrails: {e}", file=sys.stderr)
+        print("Tip: try --timeout 90 --retries 6", file=sys.stderr)
+        sys.exit(1)
+
     if args.limit and args.limit > 0:
         subs = subs[: args.limit]
 
@@ -213,7 +291,7 @@ def main():
 
     do_asn = not args.no_asn
 
-    results: list[tuple[str, str]] = []
+    results: List[Tuple[str, str]] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         futs = {ex.submit(summarize_fqdn, fqdn, do_asn): fqdn for fqdn in subs}
         for fut in as_completed(futs):
@@ -226,12 +304,12 @@ def main():
 
     results.sort(key=lambda x: x[0])
 
-    # Dynamic column width: minimum 40, maximum 90
+    # Align first column
     width = 40
     if results:
         width = max(width, min(90, max(len(n) for n, _ in results) + 2))
 
-    freq: dict[str, int] = {}
+    freq: Dict[str, int] = {}
 
     for name, rest in results:
         update_freq(freq, name)
@@ -243,11 +321,9 @@ def main():
     print()
     print(f"Subdomains count: {len(results)}")
 
-    # Pretty aligned frequency breakdown, in the requested order
+    key_width = 20
     if results:
         key_width = max(20, min(40, max(len(k) for k in ALL_KEYWORDS_ORDERED) + 2))
-    else:
-        key_width = 20
 
     for kw in ALL_KEYWORDS_ORDERED:
         print(f"{kw:<{key_width}} {freq.get(kw, 0)}")
